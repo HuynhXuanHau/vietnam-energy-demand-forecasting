@@ -4,6 +4,8 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
+from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
+
 from models import (
     compute_metrics,
     fit_linear, predict_linear,
@@ -20,7 +22,7 @@ st.set_page_config(page_title="Generic Time-Series Forecasting", layout="wide")
 st.title("Time-Series Forecasting App")
 
 # =========================
-# TABLE STYLE (đậm hơn)
+# TABLE STYLE
 # =========================
 def style_table(df: pd.DataFrame):
     return (
@@ -49,6 +51,95 @@ def style_table(df: pd.DataFrame):
     )
 
 # =========================
+# ROBUST PARSERS (TỔNG QUÁT)
+# =========================
+def parse_numeric_series(s: pd.Series) -> pd.Series:
+    """
+    Parse numeric values robustly:
+    - 1,234,567
+    - 1.234.567
+    - 1,234.56
+    - 1.234,56
+    - '2,054,309 khách'
+    """
+    s = s.astype(str).str.strip()
+    s = s.str.replace(r"\s+", "", regex=True)
+
+    # keep digits, separators, minus
+    s = s.str.replace(r"[^0-9,\.\-]", "", regex=True)
+
+    mask_both = s.str.contains(",") & s.str.contains(".")
+
+    def normalize(x: str) -> str:
+        if "," in x and "." in x:
+            # if last separator is "," => EU decimal
+            if x.rfind(",") > x.rfind("."):
+                x = x.replace(".", "").replace(",", ".")
+            else:
+                x = x.replace(",", "")
+        else:
+            # only one type of sep:
+            # heuristic: if contains ',' and has <=2 digits after it => decimal
+            if "," in x:
+                if len(x.split(",")[-1]) <= 2:
+                    x = x.replace(".", "").replace(",", ".")
+                else:
+                    x = x.replace(",", "")
+            elif "." in x:
+                if len(x.split(".")[-1]) <= 2:
+                    x = x.replace(",", "")
+                else:
+                    x = x.replace(".", "")
+        return x
+
+    s.loc[mask_both] = s.loc[mask_both].apply(normalize)
+    s.loc[~mask_both] = s.loc[~mask_both].apply(normalize)
+
+    return pd.to_numeric(s, errors="coerce")
+
+
+def parse_time_column(s: pd.Series):
+    """
+    Return (parsed_series, time_kind) where time_kind in: numeric | datetime | string
+    Supports:
+    - Year: 2020, 2020.0
+    - Month-year: Jan-22, Mar-25, 2022-03, 03-2022, 03/2022...
+    - Date formats
+    """
+    s_raw = s.copy()
+
+    # 1) numeric first to avoid Year -> 1970 datetime bug
+    time_num = pd.to_numeric(s, errors="coerce")
+    is_mostly_numeric = time_num.notna().mean() >= 0.9
+    looks_like_year = is_mostly_numeric and time_num.between(1000, 3000).mean() >= 0.9
+    if looks_like_year:
+        return time_num.astype(int), "numeric"
+
+    # 2) try datetime auto
+    time_dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+    # 3) try common formats if fail a lot
+    if time_dt.notna().mean() < 0.6:
+        formats = ["%b-%y", "%b-%Y", "%Y-%m", "%Y/%m", "%m-%Y", "%m/%Y", "%Y"]
+        best = time_dt
+        for f in formats:
+            tmp = pd.to_datetime(s.astype(str).str.strip(), format=f, errors="coerce")
+            if tmp.notna().mean() > best.notna().mean():
+                best = tmp
+        time_dt = best
+
+    if time_dt.notna().mean() >= 0.6 and time_dt.nunique() >= 3:
+        return time_dt, "datetime"
+
+    # 4) numeric but not year
+    if is_mostly_numeric:
+        return time_num.astype(float), "numeric"
+
+    # 5) fallback string
+    return s_raw.astype(str), "string"
+
+
+# =========================
 # LOAD RAW
 # =========================
 @st.cache_data(show_spinner=False)
@@ -72,71 +163,66 @@ st.subheader("Dữ liệu gốc")
 st.dataframe(style_table(raw_df), use_container_width=True, height=260)
 
 # =========================
-# SELECT COLS
+# SELECT COLS (1 HÀNG)
 # =========================
 st.subheader("Chọn cột Time & Target")
-
 col_time, col_target = st.columns([1, 1])
 
 with col_time:
-    time_col = st.selectbox(
-        "Cột Time",
-        raw_df.columns,
-        index=0
-    )
+    time_col = st.selectbox("Cột Time", raw_df.columns, index=0)
 
 with col_target:
-    target_col = st.selectbox(
-        "Cột Target",
-        raw_df.columns,
-        index=min(1, len(raw_df.columns) - 1)
-    )
+    target_col = st.selectbox("Cột Target", raw_df.columns, index=min(1, len(raw_df.columns) - 1))
 
 df = raw_df[[time_col, target_col]].copy()
-df.columns = ["Time_raw", "Target"]
+df.columns = ["Time_raw", "Target_raw"]
 
-# Target numeric
-df["Target"] = pd.to_numeric(df["Target"], errors="coerce")
+# Parse Target robustly
+df["Target"] = parse_numeric_series(df["Target_raw"])
 
-s = df["Time_raw"]
+# Parse Time robustly
+df["Time"], time_kind = parse_time_column(df["Time_raw"])
 
-# Ưu tiên numeric trước để tránh Year bị hiểu nhầm thành epoch datetime
-time_num = pd.to_numeric(s, errors="coerce")
-
-# Nếu gần như toàn bộ là số và giá trị giống year (1000-3000) => coi là numeric (year)
-is_mostly_numeric = time_num.notna().mean() >= 0.9
-looks_like_year = is_mostly_numeric and time_num.between(1000, 3000).mean() >= 0.9
-
-if looks_like_year:
-    df["Time"] = time_num.astype(int)
-    time_kind = "numeric"
-else:
-    # Nếu không phải year numeric thì mới thử parse datetime
-    time_dt = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
-
-    if time_dt.notna().mean() >= 0.6 and time_dt.nunique() >= 3:
-        df["Time"] = time_dt
-        time_kind = "datetime"
-    elif is_mostly_numeric:
-        df["Time"] = time_num.astype(float)
-        time_kind = "numeric"
-    else:
-        df["Time"] = s.astype(str)
-        time_kind = "string"
-
+# Drop invalid target
 df = df.dropna(subset=["Target"]).copy()
 
-# sort by Time nếu sort được
+# Stop if empty / too small
+if df.empty or len(df) < 3:
+    st.error(
+        "Dữ liệu sau xử lý không đủ (hoặc Target không parse được).\n"
+        "Hãy kiểm tra lại cột Target (dấu phẩy/chấm/ký tự) và cột Time."
+    )
+    st.stop()
+
+# Sort
 if time_kind in ("datetime", "numeric"):
     df = df.sort_values("Time").reset_index(drop=True)
 else:
     df = df.reset_index(drop=True)
 
-# Index nội bộ cho model
+# Internal index for models
 df["Index"] = np.arange(len(df))
 
 st.subheader("Dữ liệu sau xử lý")
-st.dataframe(style_table(df[["Time", "Target"]]), use_container_width=True)
+show_df = df[["Time", "Target"]].copy()
+
+# display nicer Target
+show_df["Target"] = show_df["Target"].round(2)
+
+# display nicer Time
+if time_kind == "numeric":
+    # remove .0
+    show_df["Time"] = pd.to_numeric(show_df["Time"], errors="coerce").astype("Int64")
+elif time_kind == "datetime":
+    inferred = pd.infer_freq(pd.to_datetime(df["Time"].dropna()))
+    if inferred and "M" in inferred:
+        show_df["Time"] = pd.to_datetime(show_df["Time"]).dt.strftime("%b-%y")
+    elif inferred and ("A" in inferred or "Y" in inferred):
+        show_df["Time"] = pd.to_datetime(show_df["Time"]).dt.strftime("%Y")
+    else:
+        show_df["Time"] = pd.to_datetime(show_df["Time"]).dt.strftime("%Y-%m-%d")
+
+st.dataframe(style_table(show_df), use_container_width=True)
 
 # =========================
 # FUTURE TIME GENERATOR
@@ -146,31 +232,36 @@ def make_future_time(series_time: pd.Series, steps: int, kind: str) -> pd.Series
         return pd.Series([], dtype=object)
 
     if kind == "datetime":
-        t = pd.to_datetime(series_time, errors="coerce")
-        t = t.dropna()
+        t = pd.to_datetime(series_time, errors="coerce").dropna()
+        if len(t) == 0:
+            return pd.Series([pd.NaT] * steps)
+
+        inferred = pd.infer_freq(t)
+        last = t.iloc[-1]
+
+        if inferred is not None:
+            rng = pd.date_range(start=last, periods=steps + 1, freq=inferred)[1:]
+            return pd.Series(rng)
+
         if len(t) >= 2:
             delta = t.iloc[-1] - t.iloc[-2]
-            # nếu delta = 0 (trùng ngày), fallback 1 day
             if delta == pd.Timedelta(0):
                 delta = pd.Timedelta(days=1)
-        else:
-            delta = pd.Timedelta(days=1)
-        start = pd.to_datetime(series_time.iloc[-1])
-        return pd.Series([start + delta * (i + 1) for i in range(steps)])
+            return pd.Series([last + delta * (i + 1) for i in range(steps)])
+
+        return pd.Series([last + pd.Timedelta(days=i + 1) for i in range(steps)])
 
     if kind == "numeric":
-        t = pd.to_numeric(series_time, errors="coerce")
-        t = t.dropna()
+        t = pd.to_numeric(series_time, errors="coerce").dropna()
         if len(t) >= 2:
             delta = t.iloc[-1] - t.iloc[-2]
             if delta == 0:
                 delta = 1
         else:
             delta = 1
-        last = float(series_time.iloc[-1])
+        last = float(pd.to_numeric(series_time.iloc[-1], errors="coerce"))
         return pd.Series([last + delta * (i + 1) for i in range(steps)])
 
-    # string fallback: hiển thị t+1, t+2...
     return pd.Series([f"t+{i+1}" for i in range(steps)])
 
 # =========================
@@ -186,35 +277,38 @@ with left:
         index=0
     )
 
-    # làm thanh ngắn: đặt trong cột hẹp hơn
     c1, c2 = st.columns([1, 1])
     with c1:
         test_pct = st.slider("Test (%)", 10, 40, 20, step=5)
     with c2:
         forecast_steps = st.number_input("Forecast steps", 1, 60, 6, step=1)
 
-    # split
     n = len(df)
     n_test = max(1, int(n * test_pct / 100))
-    n_train = n - n_test
+    n_train = max(1, n - n_test)
+
+    # ensure at least 2 points for training some models
+    if n_train < 2:
+        st.error("Train quá ít. Giảm % test hoặc dùng dữ liệu dài hơn.")
+        st.stop()
 
     train_df = df.iloc[:n_train].copy()
     test_df = df.iloc[n_train:].copy()
 
     st.markdown("### Split")
-    st.write(f"Train: **{n_train}** mẫu")
-    st.write(f"Test: **{n_test}** mẫu")
+    st.write(f"Train: **{len(train_df)}** mẫu")
+    st.write(f"Test: **{len(test_df)}** mẫu")
 
-    # =========================
-    # TRAIN / PREDICT
-    # =========================
     x_train = train_df["Index"].to_numpy()
     x_test = test_df["Index"].to_numpy()
 
     y_train = train_df["Target"].to_numpy()
     y_test = test_df["Target"].to_numpy()
 
-    future_index = np.arange(df["Index"].iloc[-1] + 1, df["Index"].iloc[-1] + 1 + forecast_steps)
+    # safe future_index
+    last_idx = int(df["Index"].iloc[-1])
+    future_index = np.arange(last_idx + 1, last_idx + 1 + int(forecast_steps))
+
     meta = {}
 
     with st.spinner("Đang train & dự báo..."):
@@ -224,7 +318,7 @@ with left:
             test_pred = np.asarray(predict_holt(m, steps=len(test_df)), dtype=float)
 
             m_full = fit_holt_additive(df["Target"].to_numpy())
-            future_pred = np.asarray(predict_holt(m_full, steps=forecast_steps), dtype=float)
+            future_pred = np.asarray(predict_holt(m_full, steps=int(forecast_steps)), dtype=float)
 
         elif model_name.startswith("SVR"):
             tmp_train = train_df.rename(columns={"Index": "Year", "Target": "Total_National_Demand"})
@@ -265,13 +359,11 @@ with left:
             test_pred = np.asarray(pred_test_full[-len(test_df):], dtype=float)
 
             best_lambda_full, _ = fit_pso_gm11(df["Target"].to_numpy())
-            pred_future_full = gm11_lambda_predict(df["Target"].to_numpy(), best_lambda_full, n_forecast=forecast_steps)
-            future_pred = np.asarray(pred_future_full[-forecast_steps:], dtype=float)
+            pred_future_full = gm11_lambda_predict(df["Target"].to_numpy(), best_lambda_full, n_forecast=int(forecast_steps))
+            future_pred = np.asarray(pred_future_full[-int(forecast_steps):], dtype=float)
             meta["best_lambda"] = float(best_lambda)
 
-    # =========================
-    # METRICS AS TEXT (không JSON)
-    # =========================
+    # METRICS
     st.markdown("### Metrics (Train)")
     tr = compute_metrics(y_train, train_pred)
     st.write(f"- **MAE**: {tr['MAE']:.4f}")
@@ -279,14 +371,13 @@ with left:
     st.write(f"- **MAPE(%)**: {tr['MAPE(%)']:.4f}")
 
     st.markdown("### Metrics (Test)")
-    te = compute_metrics(y_test, test_pred)
+    te = compute_metrics(y_test, test_pred) if len(test_df) > 0 else {"MAE": np.nan, "RMSE": np.nan, "MAPE(%)": np.nan}
     st.write(f"- **MAE**: {te['MAE']:.4f}")
     st.write(f"- **RMSE**: {te['RMSE']:.4f}")
     st.write(f"- **MAPE(%)**: {te['MAPE(%)']:.4f}")
 
     if meta:
         st.markdown("### Thông tin thêm")
-
         for k, v in meta.items():
             if isinstance(v, dict):
                 st.write(f"**{k}:**")
@@ -298,33 +389,25 @@ with left:
 with right:
     st.markdown("## Biểu đồ")
 
-    def set_time_ticks(ax, time_values, max_ticks=8):
-        """
-        Hiển thị giá trị Time rõ ràng trên trục X
-        """
-        time_series = pd.Series(time_values).dropna()
-        n = len(time_values)
-        if n <= max_ticks:
-            ticks = time_values
-        else:
-            idx = np.linspace(0, n - 1, max_ticks, dtype=int)
-            ticks = time_values.iloc[idx]
+    def set_time_ticks(ax, time_values, max_ticks=10):
+        s = pd.Series(time_values).dropna()
+        if len(s) == 0:
+            return
+
+        n = len(s)
+        idx = np.arange(n) if n <= max_ticks else np.linspace(0, n - 1, max_ticks, dtype=int)
+        ticks = s.iloc[idx]
 
         ax.set_xticks(ticks)
 
-        # Nếu là datetime → format đẹp
-        if np.issubdtype(time_values.dtype, np.datetime64):
-            labels = [t.strftime("%Y-%m-%d") for t in ticks]
+        if is_datetime64_any_dtype(s):
+            inferred = pd.infer_freq(pd.to_datetime(s))
+            fmt = "%b-%y" if inferred and "M" in inferred else "%Y-%m-%d"
+            labels = [pd.to_datetime(t).strftime(fmt) for t in ticks]
+        elif is_numeric_dtype(s):
+            labels = [str(int(round(float(t)))) for t in ticks]  # bỏ .0
         else:
-            if np.issubdtype(time_series.dtype, np.datetime64):
-                labels = [t.strftime("%Y") for t in ticks]
-
-            elif np.issubdtype(time_series.dtype, np.number):
-                # BỎ .0
-                labels = [str(int(round(t))) for t in ticks]
-
-            else:
-                labels = [str(t) for t in ticks]
+            labels = [str(t) for t in ticks]
 
         ax.set_xticklabels(labels, rotation=30, ha="right")
 
@@ -332,70 +415,73 @@ with right:
         fig = plt.figure(figsize=(11, 4.6))
         ax = plt.gca()
 
-        # Actual/Pred Train
         ax.plot(train_df["Time"], y_train, marker="o", linewidth=2.2, label="Actual (Train)")
         ax.plot(train_df["Time"], train_pred, marker=".", linestyle="--", linewidth=2.0, label="Pred (Train)")
 
-        # Actual/Pred Test
-        ax.plot(test_df["Time"], y_test, marker="o", linewidth=2.2, label="Actual (Test)")
-        ax.plot(test_df["Time"], test_pred, marker=".", linestyle="--", linewidth=2.0, label="Pred (Test)")
+        if len(test_df) > 0:
+            ax.plot(test_df["Time"], y_test, marker="o", linewidth=2.2, label="Actual (Test)")
+            ax.plot(test_df["Time"], test_pred, marker=".", linestyle="--", linewidth=2.0, label="Pred (Test)")
 
         ax.set_xlabel("Time")
         ax.set_ylabel("Value")
         ax.grid(True, linestyle="--", alpha=0.5)
         ax.legend(loc="upper left", frameon=True)
-        set_time_ticks(ax, df["Time"])
+
+        set_time_ticks(ax, df["Time"], max_ticks=12)
         plt.tight_layout()
         return fig
 
     def plot_pretty_forecast():
-        future_time = make_future_time(df["Time"], forecast_steps, time_kind)
+        future_time = make_future_time(df["Time"], int(forecast_steps), time_kind)
 
         fig = plt.figure(figsize=(11, 4.6))
         ax = plt.gca()
 
         ax.plot(df["Time"], df["Target"], marker="o", linewidth=2.2, label="Actual")
-        ax.plot(future_time, future_pred, marker="*", linestyle="--", linewidth=2.0, label=f"Forecast (+{forecast_steps})")
+        ax.plot(future_time, future_pred, marker="*", linestyle="--", linewidth=2.0, label=f"Forecast (+{int(forecast_steps)})")
 
         ax.set_xlabel("Time")
         ax.set_ylabel("Value")
         ax.grid(True, linestyle="--", alpha=0.5)
         ax.legend(loc="upper left", frameon=True)
+
         all_time = pd.concat([df["Time"], future_time], ignore_index=True)
-        set_time_ticks(ax, all_time)
+        set_time_ticks(ax, all_time, max_ticks=12)
 
         plt.tight_layout()
         return fig, future_time
 
     st.markdown("### Train/Test")
-    fig1 = plot_pretty_train_test()
-    st.pyplot(fig1, clear_figure=True)
+    st.pyplot(plot_pretty_train_test(), clear_figure=True)
 
     st.markdown("### Forecast")
     fig2, future_time = plot_pretty_forecast()
     st.pyplot(fig2, clear_figure=True)
 
 # =========================
-# FORECAST TABLE (Time thật)
+# FORECAST TABLE
 # =========================
 out = pd.DataFrame({
     "Time": future_time,
     "Forecast": future_pred
 })
 
-# ----- FORMAT HIỂN THỊ -----
+# format Time
+if is_numeric_dtype(out["Time"]):
+    out["Time"] = pd.to_numeric(out["Time"], errors="coerce").round().astype("Int64")
+elif is_datetime64_any_dtype(out["Time"]):
+    inferred = pd.infer_freq(pd.to_datetime(df["Time"].dropna()))
+    if inferred and "M" in inferred:
+        out["Time"] = pd.to_datetime(out["Time"]).dt.strftime("%b-%y")
+    elif inferred and ("A" in inferred or "Y" in inferred):
+        out["Time"] = pd.to_datetime(out["Time"]).dt.strftime("%Y")
+    else:
+        out["Time"] = pd.to_datetime(out["Time"]).dt.strftime("%Y-%m-%d")
 
-# Nếu Time là numeric (year, step, …) → bỏ .000
-if np.issubdtype(out["Time"].dtype, np.number):
-    out["Time"] = out["Time"].astype(int)
+# format Forecast
+out["Forecast"] = pd.to_numeric(out["Forecast"], errors="coerce").round(2)
 
-# Nếu Time là datetime → format đẹp
-elif np.issubdtype(out["Time"].dtype, np.datetime64):
-    out["Time"] = out["Time"].dt.strftime("%Y-%m-%d")
-
-# Làm tròn forecast 2 chữ số
-out["Forecast"] = out["Forecast"].round(2)
-
+st.markdown("### Bảng dự báo")
 st.dataframe(style_table(out), use_container_width=True)
 
 csv_bytes = out.to_csv(index=False).encode("utf-8")
